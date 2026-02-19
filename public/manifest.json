@@ -1,0 +1,15 @@
+{
+  "manifest_version": 3,
+  "name": "Session Restore Plus",
+  "description": "Save and restore named browser session snapshots.",
+  "version": "0.1.0",
+  "action": {
+    "default_title": "Session Restore Plus",
+    "default_popup": "popup.html"
+  },
+  "background": {
+    "service_worker": "assets/background.js",
+    "type": "module"
+  },
+  "permissions": ["tabs", "tabGroups", "storage", "contextMenus", "startup"]
+}
