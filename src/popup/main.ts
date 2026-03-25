@@ -64,6 +64,7 @@ app.innerHTML = `
         <input id="restoreOnStartup" type="checkbox" />
         <span>Restore last snapshot on startup</span>
       </label>
+      <div class="hint">Sessions restore is temporarily disabled (experimental). Rebuild restore mode is active.</div>
     </section>
     <section class="popup__section">
       <h2>Last action</h2>
@@ -92,6 +93,11 @@ saveButton.addEventListener("click", async () => {
   if (name === null) {
     return;
   }
+  renderLastAction({
+    type: "save",
+    at: new Date().toISOString(),
+    message: "Saving snapshot..."
+  });
 
   const response = await sendMessage<{ ok: boolean; error?: string }>({
     type: "saveSnapshot",

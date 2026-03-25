@@ -7,6 +7,7 @@ const LEGACY_STATE_KEY = "sessionRestorePlus";
 const SNAPSHOT_KEY_PREFIX = "snapshot:";
 const MAX_SNAPSHOTS = 50;
 const META_SCHEMA_VERSION = 1 as const;
+const SESSIONS_SNAPSHOT_SCHEMA_VERSION = 1 as const;
 
 const UNSUPPORTED_URL_PREFIXES = ["chrome://", "chrome-extension://", "edge://", "about:"];
 
@@ -60,10 +61,28 @@ type SnapshotIndexItem = {
   groupsCount: number;
 };
 
+type SessionsSnapshotWindow = {
+  sessionId: string;
+  tabsCount: number;
+  groupsCount: number;
+};
+
+type SessionsSnapshot = {
+  type: "sessionsSnapshot";
+  schemaVersion: typeof SESSIONS_SNAPSHOT_SCHEMA_VERSION;
+  id: string;
+  name: string;
+  createdAt: string;
+  windows: SessionsSnapshotWindow[];
+};
+
+type StoredSnapshot = Snapshot | SessionsSnapshot;
+
 type StoredMeta = {
   schemaVersion: typeof META_SCHEMA_VERSION;
   snapshots: SnapshotIndexItem[];
   restoreLastOnStartup: boolean;
+  useSessionsRestore: boolean;
   lastSnapshotId: string | null;
   lastAction: LastAction | null;
 };
@@ -78,9 +97,12 @@ const defaultMeta: StoredMeta = {
   schemaVersion: META_SCHEMA_VERSION,
   snapshots: [],
   restoreLastOnStartup: false,
+  useSessionsRestore: false,
   lastSnapshotId: null,
   lastAction: null
 };
+
+let startupRestoreInProgress = false;
 
 chrome.runtime.onInstalled.addListener(async () => {
   await ensureStorage();
@@ -88,37 +110,45 @@ chrome.runtime.onInstalled.addListener(async () => {
 });
 
 chrome.runtime.onStartup.addListener(async () => {
+  if (startupRestoreInProgress) {
+    return;
+  }
+  startupRestoreInProgress = true;
   await ensureStorage();
-  const meta = await getMeta();
-  if (!meta.restoreLastOnStartup || !meta.lastSnapshotId) {
-    return;
-  }
+  try {
+    const meta = await getMeta();
+    if (!meta.restoreLastOnStartup || !meta.lastSnapshotId) {
+      return;
+    }
 
-  const snapshot = await getSnapshotPayload(meta.lastSnapshotId);
-  if (!snapshot) {
-    meta.lastAction = {
-      type: "error",
-      at: new Date().toISOString(),
-      message: "Startup restore failed: Snapshot payload was not found."
-    };
-    await saveMeta(meta);
-    return;
-  }
-
-  const restoreResult = await restoreSnapshotInternal(snapshot);
-  meta.lastAction = restoreResult.ok
-    ? {
-        type: "restore",
-        at: new Date().toISOString(),
-        message: `Startup restore completed for "${resolveSnapshotName(meta, snapshot.id, snapshot.name)}".`,
-        summary: restoreResult.summary
-      }
-    : {
+    const snapshot = await getSnapshotPayload(meta.lastSnapshotId);
+    if (!snapshot) {
+      meta.lastAction = {
         type: "error",
         at: new Date().toISOString(),
-        message: `Startup restore failed: ${restoreResult.error}`
+        message: "Startup restore failed: Snapshot payload was not found."
       };
-  await saveMeta(meta);
+      await saveMeta(meta);
+      return;
+    }
+
+    const restoreResult = await restoreSnapshotInternal(snapshot);
+    meta.lastAction = restoreResult.ok
+      ? {
+          type: "restore",
+          at: new Date().toISOString(),
+          message: `Startup restore completed for "${resolveSnapshotName(meta, snapshot.id, snapshot.name)}".`,
+          summary: restoreResult.summary
+        }
+      : {
+          type: "error",
+          at: new Date().toISOString(),
+          message: `Startup restore failed: ${restoreResult.error}`
+        };
+    await saveMeta(meta);
+  } finally {
+    startupRestoreInProgress = false;
+  }
 });
 
 chrome.contextMenus.onClicked.addListener(async (info) => {
@@ -244,6 +274,7 @@ async function migrateLegacyStateToLocalPayloads(): Promise<void> {
     schemaVersion: META_SCHEMA_VERSION,
     snapshots: orderedSnapshots.map(buildSnapshotIndexItem),
     restoreLastOnStartup: legacy.restoreLastOnStartup === true,
+    useSessionsRestore: false,
     lastSnapshotId: orderedSnapshots[0]?.id ?? null,
     lastAction: isLastAction(legacy.lastAction) ? legacy.lastAction : null
   };
@@ -289,6 +320,7 @@ function parseMeta(value: unknown): StoredMeta | null {
 
   const snapshots = Array.isArray(value.snapshots) ? value.snapshots.filter(isSnapshotIndexItem) : [];
   const restoreLastOnStartup = typeof value.restoreLastOnStartup === "boolean" ? value.restoreLastOnStartup : false;
+  const useSessionsRestore = typeof value.useSessionsRestore === "boolean" ? value.useSessionsRestore : false;
   const lastSnapshotId = typeof value.lastSnapshotId === "string" ? value.lastSnapshotId : null;
   const lastAction = isLastAction(value.lastAction) ? value.lastAction : null;
 
@@ -296,6 +328,7 @@ function parseMeta(value: unknown): StoredMeta | null {
     schemaVersion: META_SCHEMA_VERSION,
     snapshots,
     restoreLastOnStartup,
+    useSessionsRestore,
     lastSnapshotId,
     lastAction
   });
@@ -310,6 +343,7 @@ function normalizeMeta(meta: StoredMeta): StoredMeta {
     schemaVersion: META_SCHEMA_VERSION,
     snapshots,
     restoreLastOnStartup: meta.restoreLastOnStartup,
+    useSessionsRestore: meta.useSessionsRestore,
     lastSnapshotId,
     lastAction: meta.lastAction
   };
@@ -439,7 +473,7 @@ async function handleMessage(message: unknown): Promise<unknown> {
   return { ok: false, error: "Unsupported message type." };
 }
 
-function applySavedSnapshotToMeta(meta: StoredMeta, snapshot: Snapshot): StoredMeta {
+function applySavedSnapshotToMeta(meta: StoredMeta, snapshot: StoredSnapshot): StoredMeta {
   const newEntry = buildSnapshotIndexItem(snapshot);
   const ordered = [newEntry, ...meta.snapshots.filter((item) => item.id !== snapshot.id)].slice(0, MAX_SNAPSHOTS);
   return normalizeMeta({
@@ -451,9 +485,15 @@ function applySavedSnapshotToMeta(meta: StoredMeta, snapshot: Snapshot): StoredM
 
 async function saveSnapshotInternal(
   name: string
-): Promise<{ ok: true; snapshot: Snapshot; removedSnapshotIds: string[] } | { ok: false; error: string }> {
-  const snapshot = await captureSnapshot(name);
-  if (!isSnapshot(snapshot) || snapshot.schemaVersion !== SNAPSHOT_SCHEMA_VERSION) {
+): Promise<{ ok: true; snapshot: StoredSnapshot; removedSnapshotIds: string[] } | { ok: false; error: string }> {
+  let snapshot: StoredSnapshot;
+  try {
+    snapshot = await captureSnapshot(name);
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : "Unknown error.";
+    return { ok: false, error: errorMessage };
+  }
+  if (!isStoredSnapshot(snapshot)) {
     return { ok: false, error: "Snapshot validation failed." };
   }
 
@@ -471,10 +511,14 @@ async function saveSnapshotInternal(
   return { ok: true, snapshot, removedSnapshotIds };
 }
 
-function buildSnapshotIndexItem(snapshot: Snapshot): SnapshotIndexItem {
+function buildSnapshotIndexItem(snapshot: StoredSnapshot): SnapshotIndexItem {
   const windowsCount = snapshot.windows.length;
-  const tabsCount = snapshot.windows.reduce((total, windowItem) => total + windowItem.tabs.length, 0);
-  const groupsCount = snapshot.windows.reduce((total, windowItem) => total + windowItem.groups.length, 0);
+  const tabsCount = isSessionsSnapshot(snapshot)
+    ? snapshot.windows.reduce((total, windowItem) => total + windowItem.tabsCount, 0)
+    : snapshot.windows.reduce((total, windowItem) => total + windowItem.tabs.length, 0);
+  const groupsCount = isSessionsSnapshot(snapshot)
+    ? snapshot.windows.reduce((total, windowItem) => total + windowItem.groupsCount, 0)
+    : snapshot.windows.reduce((total, windowItem) => total + windowItem.groups.length, 0);
   return {
     id: snapshot.id,
     name: snapshot.name,
@@ -496,11 +540,11 @@ async function updateSnapshotPayloadName(snapshotId: string, name: string): Prom
   });
 }
 
-async function getSnapshotPayload(snapshotId: string): Promise<Snapshot | null> {
+async function getSnapshotPayload(snapshotId: string): Promise<StoredSnapshot | null> {
   const key = snapshotStorageKey(snapshotId);
   const data = await chrome.storage.local.get(key);
   const payload = data[key];
-  return isSnapshot(payload) ? payload : null;
+  return isStoredSnapshot(payload) ? payload : null;
 }
 
 async function removeSnapshotPayloads(snapshotIds: string[]): Promise<void> {
@@ -520,31 +564,29 @@ function resolveSnapshotName(meta: StoredMeta, snapshotId: string, fallbackName:
 
 async function captureSnapshot(name: string): Promise<Snapshot> {
   const windows = await chrome.windows.getAll({ populate: true, windowTypes: ["normal"] });
-  const snapshotWindows = await Promise.all(
-    windows.map(async (windowItem) => {
-      const tabs = [...(windowItem.tabs ?? [])].sort((a, b) => a.index - b.index);
-      const capturedTabs: SnapshotTab[] = tabs.map((tab, position) => ({
-        url: tab.url ?? tab.pendingUrl ?? "about:blank",
-        pinned: Boolean(tab.pinned),
-        active: Boolean(tab.active),
-        index: position,
-        groupId: tab.groupId !== undefined && tab.groupId >= 0 ? tab.groupId : undefined
-      }));
+  const snapshotWindows = windows.map((windowItem) => {
+    const tabs = [...(windowItem.tabs ?? [])].sort((a, b) => a.index - b.index);
+    const capturedTabs: SnapshotTab[] = tabs.map((tab, position) => ({
+      url: tab.url ?? tab.pendingUrl ?? "about:blank",
+      pinned: Boolean(tab.pinned),
+      active: Boolean(tab.active),
+      index: position,
+      groupId: tab.groupId !== undefined && tab.groupId >= 0 ? tab.groupId : undefined
+    }));
 
-      const groups = await captureWindowGroups(windowItem.id, tabs);
-      return {
-        bounds: {
-          left: windowItem.left,
-          top: windowItem.top,
-          width: windowItem.width,
-          height: windowItem.height,
-          state: windowItem.state
-        },
-        tabs: capturedTabs,
-        groups
-      };
-    })
-  );
+    const groups = captureWindowGroups(tabs);
+    return {
+      bounds: {
+        left: windowItem.left,
+        top: windowItem.top,
+        width: windowItem.width,
+        height: windowItem.height,
+        state: windowItem.state
+      },
+      tabs: capturedTabs,
+      groups
+    };
+  });
 
   return {
     schemaVersion: SNAPSHOT_SCHEMA_VERSION,
@@ -555,11 +597,7 @@ async function captureSnapshot(name: string): Promise<Snapshot> {
   };
 }
 
-async function captureWindowGroups(windowId: number | undefined, tabs: chrome.tabs.Tab[]): Promise<SnapshotGroup[]> {
-  if (windowId === undefined) {
-    return [];
-  }
-
+function captureWindowGroups(tabs: chrome.tabs.Tab[]): SnapshotGroup[] {
   const groupIdSet = new Set<number>();
   tabs.forEach((tab) => {
     if (typeof tab.groupId === "number" && tab.groupId >= 0) {
@@ -570,32 +608,31 @@ async function captureWindowGroups(windowId: number | undefined, tabs: chrome.ta
   const groups: SnapshotGroup[] = [];
   const orderedTabs = [...tabs].sort((a, b) => a.index - b.index);
   for (const groupId of groupIdSet) {
-    try {
-      const group = await chrome.tabGroups.get(groupId);
-      const tabIndexes = orderedTabs
-        .map((tab, position) => ({ groupId: tab.groupId, position }))
-        .filter((item) => item.groupId === groupId)
-        .map((item) => item.position);
-      groups.push({
-        id: group.id,
-        title: group.title,
-        color: group.color,
-        collapsed: group.collapsed,
-        tabIndexes
-      });
-    } catch {
-      // Ignore groups that no longer exist.
-    }
+    const tabIndexes = orderedTabs
+      .map((tab, position) => ({ groupId: tab.groupId, position }))
+      .filter((item) => item.groupId === groupId)
+      .map((item) => item.position);
+    groups.push({
+      id: groupId,
+      title: "",
+      color: "grey",
+      collapsed: false,
+      tabIndexes
+    });
   }
 
   return groups;
 }
 
 async function restoreSnapshotInternal(
-  snapshot: Snapshot
+  snapshot: StoredSnapshot
 ): Promise<{ ok: true; summary: RestoreSummary } | { ok: false; error: string }> {
-  if (!isSnapshot(snapshot) || snapshot.schemaVersion !== SNAPSHOT_SCHEMA_VERSION) {
+  if (!isStoredSnapshot(snapshot)) {
     return { ok: false, error: "Snapshot schema validation failed." };
+  }
+
+  if (isSessionsSnapshot(snapshot)) {
+    return { ok: false, error: "Sessions restore is temporarily disabled. Save a new snapshot and restore in rebuild mode." };
   }
 
   const allowFileUrls = await isFileUrlRestoreAllowed();
@@ -604,68 +641,20 @@ async function restoreSnapshotInternal(
     tabsRestored: 0,
     tabsSkipped: []
   };
-  const restoredGroupsByWindow = new Map<number, RestoredGroup[]>();
 
   for (let windowIndex = 0; windowIndex < snapshot.windows.length; windowIndex += 1) {
     const snapshotWindow = snapshot.windows[windowIndex];
     const createdWindow = await createTargetWindow(snapshotWindow);
     summary.windowsCreated += 1;
 
-    const createdTabIdsByIndex = new Map<number, number>();
-    const defaultTabId = createdWindow.tabs?.[0]?.id;
-    let usedDefaultTab = false;
-    let nextIndex = 0;
-
-    for (let tabIndex = 0; tabIndex < snapshotWindow.tabs.length; tabIndex += 1) {
-      const snapshotTab = snapshotWindow.tabs[tabIndex];
-      if (!isRestorableUrl(snapshotTab.url, allowFileUrls)) {
-        summary.tabsSkipped.push({
-          windowIndex,
-          tabIndex,
-          url: snapshotTab.url,
-          reason: "unsupported-url"
-        });
-        continue;
-      }
-
-      if (!usedDefaultTab && typeof defaultTabId === "number") {
-        const updatedTab = await chrome.tabs.update(defaultTabId, {
-          url: snapshotTab.url,
-          active: false
-        });
-        if (typeof updatedTab.id === "number") {
-          createdTabIdsByIndex.set(tabIndex, updatedTab.id);
-          summary.tabsRestored += 1;
-          usedDefaultTab = true;
-          nextIndex = 1;
-        }
-        continue;
-      }
-
-      const createdTab = await chrome.tabs.create({
-        windowId: createdWindow.id,
-        url: snapshotTab.url,
-        active: false,
-        index: nextIndex
-      });
-      if (typeof createdTab.id === "number") {
-        createdTabIdsByIndex.set(tabIndex, createdTab.id);
-        summary.tabsRestored += 1;
-        nextIndex += 1;
-      }
-    }
+    const createdTabIdsByIndex = await populateWindowTabs(createdWindow, snapshotWindow.tabs, {
+      allowFileUrls,
+      includeSkippedTabsInSummary: true,
+      summary,
+      windowIndex
+    });
 
     await applyPinnedAndActive(snapshotWindow.tabs, createdTabIdsByIndex);
-    if (typeof createdWindow.id === "number") {
-      const restoredGroups = await restoreWindowGroups(snapshotWindow.groups, createdTabIdsByIndex);
-      if (restoredGroups.length > 0) {
-        restoredGroupsByWindow.set(createdWindow.id, restoredGroups);
-      }
-    }
-  }
-
-  if (restoredGroupsByWindow.size > 0) {
-    await finalizeRestoredGroupMetadata(restoredGroupsByWindow);
   }
 
   return { ok: true, summary };
@@ -688,6 +677,73 @@ async function createTargetWindow(snapshotWindow: Snapshot["windows"][number]): 
     width: bounds.width,
     height: bounds.height
   });
+}
+
+type PopulateWindowTabsOptions = {
+  allowFileUrls: boolean;
+  includeSkippedTabsInSummary: boolean;
+  summary: RestoreSummary | null;
+  windowIndex: number;
+};
+
+async function populateWindowTabs(
+  targetWindow: chrome.windows.Window,
+  snapshotTabs: SnapshotTab[],
+  options: PopulateWindowTabsOptions
+): Promise<Map<number, number>> {
+  const createdTabIdsByIndex = new Map<number, number>();
+  const defaultTabId = targetWindow.tabs?.[0]?.id;
+  let usedDefaultTab = false;
+  let nextIndex = 0;
+
+  for (let tabIndex = 0; tabIndex < snapshotTabs.length; tabIndex += 1) {
+    const snapshotTab = snapshotTabs[tabIndex];
+    if (!isRestorableUrl(snapshotTab.url, options.allowFileUrls)) {
+      if (options.includeSkippedTabsInSummary && options.summary) {
+        options.summary.tabsSkipped.push({
+          windowIndex: options.windowIndex,
+          tabIndex,
+          url: snapshotTab.url,
+          reason: "unsupported-url"
+        });
+      } else {
+        throw new Error(`Cannot capture unsupported URL "${snapshotTab.url}".`);
+      }
+      continue;
+    }
+
+    if (!usedDefaultTab && typeof defaultTabId === "number") {
+      const updatedTab = await chrome.tabs.update(defaultTabId, {
+        url: snapshotTab.url,
+        active: false
+      });
+      if (typeof updatedTab.id === "number") {
+        createdTabIdsByIndex.set(tabIndex, updatedTab.id);
+        usedDefaultTab = true;
+        nextIndex = 1;
+        if (options.summary) {
+          options.summary.tabsRestored += 1;
+        }
+      }
+      continue;
+    }
+
+    const createdTab = await chrome.tabs.create({
+      windowId: targetWindow.id,
+      url: snapshotTab.url,
+      active: false,
+      index: nextIndex
+    });
+    if (typeof createdTab.id === "number") {
+      createdTabIdsByIndex.set(tabIndex, createdTab.id);
+      nextIndex += 1;
+      if (options.summary) {
+        options.summary.tabsRestored += 1;
+      }
+    }
+  }
+
+  return createdTabIdsByIndex;
 }
 
 async function applyPinnedAndActive(
@@ -714,73 +770,6 @@ async function applyPinnedAndActive(
       await chrome.tabs.update(activeTabId, { active: true });
     }
   }
-}
-
-type RestoredGroup = {
-  groupId: number;
-  title: string;
-  color: chrome.tabGroups.ColorEnum;
-  collapsed: boolean;
-};
-
-async function restoreWindowGroups(
-  groups: SnapshotGroup[],
-  createdTabIdsByIndex: Map<number, number>
-): Promise<RestoredGroup[]> {
-  const restoredGroups: RestoredGroup[] = [];
-  for (const group of groups) {
-    const tabIds = group.tabIndexes
-      .map((tabIndex) => createdTabIdsByIndex.get(tabIndex))
-      .filter((tabId): tabId is number => typeof tabId === "number");
-    if (tabIds.length === 0) {
-      continue;
-    }
-
-    const groupId = await chrome.tabs.group({ tabIds });
-    restoredGroups.push({
-      groupId,
-      title: group.title,
-      color: group.color,
-      collapsed: group.collapsed
-    });
-    await sleep(35);
-  }
-
-  return restoredGroups;
-}
-
-async function finalizeRestoredGroupMetadata(restoredGroupsByWindow: Map<number, RestoredGroup[]>): Promise<void> {
-  await sleep(500);
-
-  for (const restoredGroups of restoredGroupsByWindow.values()) {
-    for (const group of restoredGroups) {
-      await chrome.tabGroups.update(group.groupId, {
-        title: group.title,
-        color: group.color,
-        collapsed: group.collapsed
-      });
-
-      const toggledCollapsed = !group.collapsed;
-      await chrome.tabGroups.update(group.groupId, {
-        title: group.title,
-        color: group.color,
-        collapsed: toggledCollapsed
-      });
-      await sleep(35);
-      await chrome.tabGroups.update(group.groupId, {
-        title: group.title,
-        color: group.color,
-        collapsed: group.collapsed
-      });
-      await sleep(35);
-    }
-  }
-}
-
-async function sleep(ms: number): Promise<void> {
-  await new Promise<void>((resolve) => {
-    setTimeout(resolve, ms);
-  });
 }
 
 function isRestorableUrl(url: string, allowFileUrls: boolean): boolean {
@@ -831,6 +820,38 @@ function isSnapshotIndexItem(value: unknown): value is SnapshotIndexItem {
     Number.isInteger(value.groupsCount) &&
     value.groupsCount >= 0
   );
+}
+
+function isSessionsSnapshot(value: unknown): value is SessionsSnapshot {
+  if (!isObject(value)) {
+    return false;
+  }
+  if (value.type !== "sessionsSnapshot" || value.schemaVersion !== SESSIONS_SNAPSHOT_SCHEMA_VERSION) {
+    return false;
+  }
+  if (typeof value.id !== "string" || typeof value.name !== "string" || typeof value.createdAt !== "string") {
+    return false;
+  }
+  if (!Array.isArray(value.windows)) {
+    return false;
+  }
+
+  return value.windows.every((windowItem) => {
+    if (!isObject(windowItem)) {
+      return false;
+    }
+    return (
+      typeof windowItem.sessionId === "string" &&
+      Number.isInteger(windowItem.tabsCount) &&
+      windowItem.tabsCount >= 0 &&
+      Number.isInteger(windowItem.groupsCount) &&
+      windowItem.groupsCount >= 0
+    );
+  });
+}
+
+function isStoredSnapshot(value: unknown): value is StoredSnapshot {
+  return isSnapshot(value) || isSessionsSnapshot(value);
 }
 
 function isLastAction(value: unknown): value is LastAction | null {

@@ -11,5 +11,5 @@
     "service_worker": "assets/background.js",
     "type": "module"
   },
-  "permissions": ["tabs", "tabGroups", "storage", "contextMenus", "startup"]
+  "permissions": ["tabs", "storage", "contextMenus", "startup"]
 }
