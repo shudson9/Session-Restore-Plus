@@ -19,9 +19,11 @@ export async function closeAllWindows(): Promise<void> {
 }
 
 /**
- * Queries the auto-created tab groups in a newly restored window, matches each
- * one to a SnapshotGroup by comparing tab membership, then applies the saved
- * title, color, and forces collapsed:true via chrome.tabGroups.update().
+ * Explicitly recreates tab groups in a newly restored window by calling
+ * chrome.tabs.group() for each SnapshotGroup, then applies the saved title,
+ * color, and collapsed state via chrome.tabGroups.update().
+ *
+ * Tabs that have no groupId in the snapshot are left ungrouped.
  *
  * @param windowId - The ID of the newly created window.
  * @param snapshotGroups - Groups captured from the original snapshot window.
@@ -36,67 +38,25 @@ export async function applyGroupsToWindow(
     return;
   }
 
-  const autoCreatedGroups = await chrome.tabGroups.query({ windowId });
-  if (autoCreatedGroups.length === 0) {
-    return;
-  }
-
-  // Build a map from auto-created group ID → set of tab IDs in that group
-  const autoGroupTabIds = new Map<number, Set<number>>();
-  for (const group of autoCreatedGroups) {
-    autoGroupTabIds.set(group.id, new Set<number>());
-  }
-
-  const allTabsInWindow = await chrome.tabs.query({ windowId });
-  for (const tab of allTabsInWindow) {
-    if (typeof tab.id === "number" && typeof tab.groupId === "number" && autoGroupTabIds.has(tab.groupId)) {
-      autoGroupTabIds.get(tab.groupId)!.add(tab.id);
-    }
-  }
-
-  // For each snapshot group, compute the set of created tab IDs it owns
   for (const snapshotGroup of snapshotGroups) {
-    const expectedTabIds = new Set<number>();
+    const tabIds: number[] = [];
     for (const tabIndex of snapshotGroup.tabIndexes) {
       const createdId = createdTabIdsByIndex.get(tabIndex);
       if (typeof createdId === "number") {
-        expectedTabIds.add(createdId);
+        tabIds.push(createdId);
       }
     }
 
-    if (expectedTabIds.size === 0) {
+    if (tabIds.length === 0) {
       continue;
     }
 
-    // Find the auto-created group whose tab-ID set matches the expected set
-    let matchedGroupId: number | undefined;
-    for (const [autoGroupId, tabIdSet] of autoGroupTabIds) {
-      if (setsEqual(tabIdSet, expectedTabIds)) {
-        matchedGroupId = autoGroupId;
-        break;
-      }
-    }
+    const newGroupId = await chrome.tabs.group({ tabIds, createProperties: { windowId } });
 
-    if (typeof matchedGroupId !== "number") {
-      continue;
-    }
-
-    await chrome.tabGroups.update(matchedGroupId, {
+    await chrome.tabGroups.update(newGroupId, {
       title: snapshotGroup.title,
       color: snapshotGroup.color,
-      collapsed: true
+      collapsed: snapshotGroup.collapsed
     });
   }
-}
-
-function setsEqual(a: Set<number>, b: Set<number>): boolean {
-  if (a.size !== b.size) {
-    return false;
-  }
-  for (const value of a) {
-    if (!b.has(value)) {
-      return false;
-    }
-  }
-  return true;
 }
