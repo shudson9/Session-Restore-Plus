@@ -1,4 +1,5 @@
-import { isSnapshot, SNAPSHOT_SCHEMA_VERSION, type Snapshot, type SnapshotGroup, type SnapshotTab } from "./lib/snapshot";
+import { isSnapshot, SNAPSHOT_SCHEMA_VERSION, type Snapshot, type SnapshotTab } from "./lib/snapshot";
+import { captureWindowGroups } from "./lib/capture";
 
 const MENU_SAVE = "save_snapshot";
 const MENU_RESTORE_LAST = "restore_last_snapshot";
@@ -564,7 +565,7 @@ function resolveSnapshotName(meta: StoredMeta, snapshotId: string, fallbackName:
 
 async function captureSnapshot(name: string): Promise<Snapshot> {
   const windows = await chrome.windows.getAll({ populate: true, windowTypes: ["normal"] });
-  const snapshotWindows = windows.map((windowItem) => {
+  const snapshotWindows = await Promise.all(windows.map(async (windowItem) => {
     const tabs = [...(windowItem.tabs ?? [])].sort((a, b) => a.index - b.index);
     const capturedTabs: SnapshotTab[] = tabs.map((tab, position) => ({
       url: tab.url ?? tab.pendingUrl ?? "about:blank",
@@ -574,7 +575,7 @@ async function captureSnapshot(name: string): Promise<Snapshot> {
       groupId: tab.groupId !== undefined && tab.groupId >= 0 ? tab.groupId : undefined
     }));
 
-    const groups = captureWindowGroups(tabs);
+    const groups = await captureWindowGroups(tabs, windowItem.id);
     return {
       bounds: {
         left: windowItem.left,
@@ -586,7 +587,7 @@ async function captureSnapshot(name: string): Promise<Snapshot> {
       tabs: capturedTabs,
       groups
     };
-  });
+  }));
 
   return {
     schemaVersion: SNAPSHOT_SCHEMA_VERSION,
@@ -595,33 +596,6 @@ async function captureSnapshot(name: string): Promise<Snapshot> {
     createdAt: new Date().toISOString(),
     windows: snapshotWindows
   };
-}
-
-function captureWindowGroups(tabs: chrome.tabs.Tab[]): SnapshotGroup[] {
-  const groupIdSet = new Set<number>();
-  tabs.forEach((tab) => {
-    if (typeof tab.groupId === "number" && tab.groupId >= 0) {
-      groupIdSet.add(tab.groupId);
-    }
-  });
-
-  const groups: SnapshotGroup[] = [];
-  const orderedTabs = [...tabs].sort((a, b) => a.index - b.index);
-  for (const groupId of groupIdSet) {
-    const tabIndexes = orderedTabs
-      .map((tab, position) => ({ groupId: tab.groupId, position }))
-      .filter((item) => item.groupId === groupId)
-      .map((item) => item.position);
-    groups.push({
-      id: groupId,
-      title: "",
-      color: "grey",
-      collapsed: false,
-      tabIndexes
-    });
-  }
-
-  return groups;
 }
 
 async function restoreSnapshotInternal(
