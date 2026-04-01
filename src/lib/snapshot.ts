@@ -46,6 +46,7 @@ export type SnapshotGroup = {
   color: chrome.tabGroups.ColorEnum;
   collapsed: boolean;
   tabIndexes: number[];
+  savedGroupId?: string;
 };
 
 export function isSnapshot(value: unknown): value is Snapshot {
@@ -115,7 +116,8 @@ function isSnapshotGroup(value: unknown): value is SnapshotGroup {
     isTabGroupColor(value.color) &&
     typeof value.collapsed === "boolean" &&
     Array.isArray(value.tabIndexes) &&
-    value.tabIndexes.every((index) => Number.isInteger(index) && index >= 0)
+    value.tabIndexes.every((index) => Number.isInteger(index) && index >= 0) &&
+    (value.savedGroupId === undefined || typeof value.savedGroupId === "string")
   );
 }
 
