@@ -1,6 +1,6 @@
 import { isSnapshot, SNAPSHOT_SCHEMA_VERSION, type Snapshot, type SnapshotTab } from "./lib/snapshot";
 import { captureWindowGroups } from "./lib/capture";
-import { applyGroupsToWindow } from "./lib/restore";
+import { applyGroupsToWindow, closeAllWindows } from "./lib/restore";
 
 const MENU_SAVE = "save_snapshot";
 const MENU_RESTORE_LAST = "restore_last_snapshot";
@@ -609,6 +609,8 @@ async function restoreSnapshotInternal(
   if (isSessionsSnapshot(snapshot)) {
     return { ok: false, error: "Sessions restore is temporarily disabled. Save a new snapshot and restore in rebuild mode." };
   }
+
+  await closeAllWindows();
 
   const allowFileUrls = await isFileUrlRestoreAllowed();
   const summary: RestoreSummary = {
