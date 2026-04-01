@@ -1,6 +1,24 @@
 import type { SnapshotGroup } from "./snapshot";
 
 /**
+ * Closes all currently open Chrome windows (best-effort) before a restore.
+ * Each window.remove() call is wrapped in its own try/catch so a single
+ * failure does not abort the process.
+ */
+export async function closeAllWindows(): Promise<void> {
+  const openWindows = await chrome.windows.getAll();
+  for (const win of openWindows) {
+    if (typeof win.id === "number") {
+      try {
+        await chrome.windows.remove(win.id);
+      } catch {
+        // Swallow — best-effort; restore continues regardless
+      }
+    }
+  }
+}
+
+/**
  * Queries the auto-created tab groups in a newly restored window, matches each
  * one to a SnapshotGroup by comparing tab membership, then applies the saved
  * title, color, and forces collapsed:true via chrome.tabGroups.update().

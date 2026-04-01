@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { applyGroupsToWindow } from "./restore";
+import { applyGroupsToWindow, closeAllWindows } from "./restore";
 import type { SnapshotGroup } from "./snapshot";
 
 function makeAutoGroup(id: number, windowId = 1): chrome.tabGroups.TabGroup {
@@ -216,5 +216,90 @@ describe("applyGroupsToWindow", () => {
     await applyGroupsToWindow(42, snapshotGroups, tabIdMap);
 
     expect(queryMock).toHaveBeenCalledWith({ windowId: 42 });
+  });
+});
+
+function makeWindow(id: number): chrome.windows.Window {
+  return {
+    id,
+    focused: false,
+    alwaysOnTop: false,
+    incognito: false,
+    type: "normal",
+    state: "normal"
+  } as chrome.windows.Window;
+}
+
+describe("closeAllWindows", () => {
+  it("calls windows.remove for each open window", async () => {
+    const getAllMock = vi.fn().mockResolvedValue([makeWindow(1), makeWindow(2)]);
+    const removeMock = vi.fn().mockResolvedValue(undefined);
+
+    vi.stubGlobal("chrome", {
+      windows: { getAll: getAllMock, remove: removeMock }
+    });
+
+    await closeAllWindows();
+
+    expect(removeMock).toHaveBeenCalledTimes(2);
+    expect(removeMock).toHaveBeenCalledWith(1);
+    expect(removeMock).toHaveBeenCalledWith(2);
+  });
+
+  it("calls remove for each window before any windows.create would be called (ordering via call order)", async () => {
+    const callOrder: string[] = [];
+
+    const getAllMock = vi.fn().mockResolvedValue([makeWindow(10), makeWindow(20)]);
+    const removeMock = vi.fn().mockImplementation((id: number) => {
+      callOrder.push(`remove:${id}`);
+      return Promise.resolve(undefined);
+    });
+    const createMock = vi.fn().mockImplementation(() => {
+      callOrder.push("create");
+      return Promise.resolve({ id: 99 });
+    });
+
+    vi.stubGlobal("chrome", {
+      windows: { getAll: getAllMock, remove: removeMock, create: createMock }
+    });
+
+    await closeAllWindows();
+    // Simulate create happening after
+    await createMock();
+
+    expect(callOrder.indexOf("remove:10")).toBeLessThan(callOrder.indexOf("create"));
+    expect(callOrder.indexOf("remove:20")).toBeLessThan(callOrder.indexOf("create"));
+  });
+
+  it("swallows a rejected remove and continues closing remaining windows", async () => {
+    const getAllMock = vi.fn().mockResolvedValue([makeWindow(1), makeWindow(2)]);
+    const removeMock = vi.fn()
+      .mockRejectedValueOnce(new Error("Cannot remove window"))
+      .mockResolvedValue(undefined);
+
+    vi.stubGlobal("chrome", {
+      windows: { getAll: getAllMock, remove: removeMock }
+    });
+
+    // Should not throw
+    await expect(closeAllWindows()).resolves.toBeUndefined();
+
+    // Both removes were attempted despite the first failing
+    expect(removeMock).toHaveBeenCalledTimes(2);
+    expect(removeMock).toHaveBeenCalledWith(1);
+    expect(removeMock).toHaveBeenCalledWith(2);
+  });
+
+  it("does nothing when there are no open windows", async () => {
+    const getAllMock = vi.fn().mockResolvedValue([]);
+    const removeMock = vi.fn().mockResolvedValue(undefined);
+
+    vi.stubGlobal("chrome", {
+      windows: { getAll: getAllMock, remove: removeMock }
+    });
+
+    await closeAllWindows();
+
+    expect(removeMock).not.toHaveBeenCalled();
   });
 });
