@@ -1,5 +1,6 @@
 import { isSnapshot, SNAPSHOT_SCHEMA_VERSION, type Snapshot, type SnapshotTab } from "./lib/snapshot";
 import { captureWindowGroups } from "./lib/capture";
+import { applyGroupsToWindow } from "./lib/restore";
 
 const MENU_SAVE = "save_snapshot";
 const MENU_RESTORE_LAST = "restore_last_snapshot";
@@ -629,6 +630,9 @@ async function restoreSnapshotInternal(
     });
 
     await applyPinnedAndActive(snapshotWindow.tabs, createdTabIdsByIndex);
+    if (typeof createdWindow.id === "number") {
+      await applyGroupsToWindow(createdWindow.id, snapshotWindow.groups, createdTabIdsByIndex);
+    }
   }
 
   return { ok: true, summary };
