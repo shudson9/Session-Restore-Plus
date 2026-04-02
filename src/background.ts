@@ -1,4 +1,6 @@
-import { isSnapshot, SNAPSHOT_SCHEMA_VERSION, type Snapshot, type SnapshotGroup, type SnapshotTab } from "./lib/snapshot";
+import { isSnapshot, SNAPSHOT_SCHEMA_VERSION, type Snapshot, type SnapshotTab } from "./lib/snapshot";
+import { captureWindowGroups } from "./lib/capture";
+import { applyGroupsToWindow, cleanupDuplicateGroups, closeAllWindows } from "./lib/restore";
 
 const MENU_SAVE = "save_snapshot";
 const MENU_RESTORE_LAST = "restore_last_snapshot";
@@ -564,7 +566,7 @@ function resolveSnapshotName(meta: StoredMeta, snapshotId: string, fallbackName:
 
 async function captureSnapshot(name: string): Promise<Snapshot> {
   const windows = await chrome.windows.getAll({ populate: true, windowTypes: ["normal"] });
-  const snapshotWindows = windows.map((windowItem) => {
+  const snapshotWindows = await Promise.all(windows.map(async (windowItem) => {
     const tabs = [...(windowItem.tabs ?? [])].sort((a, b) => a.index - b.index);
     const capturedTabs: SnapshotTab[] = tabs.map((tab, position) => ({
       url: tab.url ?? tab.pendingUrl ?? "about:blank",
@@ -574,7 +576,7 @@ async function captureSnapshot(name: string): Promise<Snapshot> {
       groupId: tab.groupId !== undefined && tab.groupId >= 0 ? tab.groupId : undefined
     }));
 
-    const groups = captureWindowGroups(tabs);
+    const groups = await captureWindowGroups(tabs, windowItem.id);
     return {
       bounds: {
         left: windowItem.left,
@@ -586,7 +588,7 @@ async function captureSnapshot(name: string): Promise<Snapshot> {
       tabs: capturedTabs,
       groups
     };
-  });
+  }));
 
   return {
     schemaVersion: SNAPSHOT_SCHEMA_VERSION,
@@ -595,33 +597,6 @@ async function captureSnapshot(name: string): Promise<Snapshot> {
     createdAt: new Date().toISOString(),
     windows: snapshotWindows
   };
-}
-
-function captureWindowGroups(tabs: chrome.tabs.Tab[]): SnapshotGroup[] {
-  const groupIdSet = new Set<number>();
-  tabs.forEach((tab) => {
-    if (typeof tab.groupId === "number" && tab.groupId >= 0) {
-      groupIdSet.add(tab.groupId);
-    }
-  });
-
-  const groups: SnapshotGroup[] = [];
-  const orderedTabs = [...tabs].sort((a, b) => a.index - b.index);
-  for (const groupId of groupIdSet) {
-    const tabIndexes = orderedTabs
-      .map((tab, position) => ({ groupId: tab.groupId, position }))
-      .filter((item) => item.groupId === groupId)
-      .map((item) => item.position);
-    groups.push({
-      id: groupId,
-      title: "",
-      color: "grey",
-      collapsed: false,
-      tabIndexes
-    });
-  }
-
-  return groups;
 }
 
 async function restoreSnapshotInternal(
@@ -635,12 +610,17 @@ async function restoreSnapshotInternal(
     return { ok: false, error: "Sessions restore is temporarily disabled. Save a new snapshot and restore in rebuild mode." };
   }
 
+  await closeAllWindows();
+
   const allowFileUrls = await isFileUrlRestoreAllowed();
   const summary: RestoreSummary = {
     windowsCreated: 0,
     tabsRestored: 0,
     tabsSkipped: []
   };
+
+  const restoredWindowIds: number[] = [];
+  const restoredGroupSignatures: Array<{ title?: string; color: string }> = [];
 
   for (let windowIndex = 0; windowIndex < snapshot.windows.length; windowIndex += 1) {
     const snapshotWindow = snapshot.windows[windowIndex];
@@ -655,7 +635,17 @@ async function restoreSnapshotInternal(
     });
 
     await applyPinnedAndActive(snapshotWindow.tabs, createdTabIdsByIndex);
+    if (typeof createdWindow.id === "number") {
+      restoredWindowIds.push(createdWindow.id);
+      await applyGroupsToWindow(createdWindow.id, snapshotWindow.groups, createdTabIdsByIndex);
+    }
+
+    for (const group of snapshotWindow.groups) {
+      restoredGroupSignatures.push({ title: group.title, color: group.color });
+    }
   }
+
+  await cleanupDuplicateGroups(restoredWindowIds, restoredGroupSignatures);
 
   return { ok: true, summary };
 }
