@@ -131,3 +131,55 @@ export async function applyGroupsToWindow(
     });
   }
 }
+
+/**
+ * Post-restore cleanup pass: finds any open tab groups in windows that were NOT
+ * part of the restore (i.e., surviving pre-restore windows) and ungroups their
+ * tabs if the group's title+color matches a group that was just restored.
+ *
+ * This dismisses stale duplicate open instances that would otherwise persist as
+ * closed Saved Tab Group chips in the bookmarks bar.
+ *
+ * Groups in windows NOT matched by title+color are left untouched.
+ * Failures are swallowed so the restore result is unaffected.
+ *
+ * @param restoredWindowIds - IDs of windows created during the restore pass.
+ * @param restoredGroups    - Title+color signatures of every group restored.
+ */
+export async function cleanupDuplicateGroups(
+  restoredWindowIds: number[],
+  restoredGroups: Array<{ title?: string; color: string }>
+): Promise<void> {
+  try {
+    const restoredWindowIdSet = new Set(restoredWindowIds);
+    const allOpenGroups = await chrome.tabGroups.query({});
+
+    const externalGroups = allOpenGroups.filter(
+      (group) => !restoredWindowIdSet.has(group.windowId)
+    );
+
+    for (const externalGroup of externalGroups) {
+      const isDuplicate = restoredGroups.some(
+        (restored) =>
+          restored.title === externalGroup.title &&
+          restored.color === externalGroup.color
+      );
+
+      if (!isDuplicate) {
+        continue;
+      }
+
+      try {
+        const tabs = await chrome.tabs.query({ groupId: externalGroup.id });
+        const tabIds = tabs.map((tab) => tab.id as number).filter((id) => typeof id === "number");
+        if (tabIds.length > 0) {
+          await chrome.tabs.ungroup(tabIds);
+        }
+      } catch {
+        // Swallow per-group failures — best-effort cleanup
+      }
+    }
+  } catch {
+    // Swallow top-level failures so restore is never aborted
+  }
+}
