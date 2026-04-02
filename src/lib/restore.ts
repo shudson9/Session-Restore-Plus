@@ -1,14 +1,38 @@
 import type { SnapshotGroup } from "./snapshot";
 
 /**
+ * Ungroups all grouped tabs in a window before it is closed.
+ * This signals to Chrome that the tab groups are being released, preventing
+ * stale Saved Tab Group chips from accumulating in the bookmarks bar.
+ * Failures are swallowed so the caller can proceed with window removal.
+ */
+async function ungroupTabsInWindow(windowId: number): Promise<void> {
+  try {
+    const tabs = await chrome.tabs.query({ windowId });
+    const groupedTabIds = tabs
+      .filter((tab) => typeof tab.id === "number" && typeof tab.groupId === "number" && tab.groupId >= 0)
+      .map((tab) => tab.id as number);
+    if (groupedTabIds.length > 0) {
+      await chrome.tabs.ungroup(groupedTabIds);
+    }
+  } catch {
+    // Swallow — best-effort; window close must still proceed
+  }
+}
+
+/**
  * Closes all currently open Chrome windows (best-effort) before a restore.
- * Each window.remove() call is wrapped in its own try/catch so a single
+ * Before closing each window, ungroupTabsInWindow() is called to release any
+ * tab groups so Chrome does not persist stale Saved Tab Group entries in the
+ * bookmarks bar across restore cycles.
+ * Each ungroup and remove call is wrapped in its own try/catch so a single
  * failure does not abort the process.
  */
 export async function closeAllWindows(): Promise<void> {
   const openWindows = await chrome.windows.getAll();
   for (const win of openWindows) {
     if (typeof win.id === "number") {
+      await ungroupTabsInWindow(win.id);
       try {
         await chrome.windows.remove(win.id);
       } catch {

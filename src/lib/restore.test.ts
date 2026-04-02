@@ -361,9 +361,12 @@ describe("closeAllWindows", () => {
   it("calls windows.remove for each open window", async () => {
     const getAllMock = vi.fn().mockResolvedValue([makeWindow(1), makeWindow(2)]);
     const removeMock = vi.fn().mockResolvedValue(undefined);
+    const tabsQueryMock = vi.fn().mockResolvedValue([]);
+    const ungroupMock = vi.fn().mockResolvedValue(undefined);
 
     vi.stubGlobal("chrome", {
-      windows: { getAll: getAllMock, remove: removeMock }
+      windows: { getAll: getAllMock, remove: removeMock },
+      tabs: { query: tabsQueryMock, ungroup: ungroupMock }
     });
 
     await closeAllWindows();
@@ -385,9 +388,12 @@ describe("closeAllWindows", () => {
       callOrder.push("create");
       return Promise.resolve({ id: 99 });
     });
+    const tabsQueryMock = vi.fn().mockResolvedValue([]);
+    const ungroupMock = vi.fn().mockResolvedValue(undefined);
 
     vi.stubGlobal("chrome", {
-      windows: { getAll: getAllMock, remove: removeMock, create: createMock }
+      windows: { getAll: getAllMock, remove: removeMock, create: createMock },
+      tabs: { query: tabsQueryMock, ungroup: ungroupMock }
     });
 
     await closeAllWindows();
@@ -403,9 +409,12 @@ describe("closeAllWindows", () => {
     const removeMock = vi.fn()
       .mockRejectedValueOnce(new Error("Cannot remove window"))
       .mockResolvedValue(undefined);
+    const tabsQueryMock = vi.fn().mockResolvedValue([]);
+    const ungroupMock = vi.fn().mockResolvedValue(undefined);
 
     vi.stubGlobal("chrome", {
-      windows: { getAll: getAllMock, remove: removeMock }
+      windows: { getAll: getAllMock, remove: removeMock },
+      tabs: { query: tabsQueryMock, ungroup: ungroupMock }
     });
 
     // Should not throw
@@ -420,13 +429,116 @@ describe("closeAllWindows", () => {
   it("does nothing when there are no open windows", async () => {
     const getAllMock = vi.fn().mockResolvedValue([]);
     const removeMock = vi.fn().mockResolvedValue(undefined);
+    const tabsQueryMock = vi.fn().mockResolvedValue([]);
+    const ungroupMock = vi.fn().mockResolvedValue(undefined);
 
     vi.stubGlobal("chrome", {
-      windows: { getAll: getAllMock, remove: removeMock }
+      windows: { getAll: getAllMock, remove: removeMock },
+      tabs: { query: tabsQueryMock, ungroup: ungroupMock }
     });
 
     await closeAllWindows();
 
     expect(removeMock).not.toHaveBeenCalled();
+  });
+
+  it("calls chrome.tabs.ungroup() with grouped tab IDs before chrome.windows.remove()", async () => {
+    const callOrder: string[] = [];
+
+    const getAllMock = vi.fn().mockResolvedValue([makeWindow(1)]);
+    // Window 1 has two grouped tabs (groupId >= 0) and one ungrouped tab (groupId -1)
+    const tabsQueryMock = vi.fn().mockResolvedValue([
+      makeTab(10, 5),  // grouped
+      makeTab(11, 5),  // grouped
+      makeTab(12, -1)  // ungrouped
+    ]);
+    const ungroupMock = vi.fn().mockImplementation(() => {
+      callOrder.push("ungroup");
+      return Promise.resolve(undefined);
+    });
+    const removeMock = vi.fn().mockImplementation(() => {
+      callOrder.push("remove");
+      return Promise.resolve(undefined);
+    });
+
+    vi.stubGlobal("chrome", {
+      windows: { getAll: getAllMock, remove: removeMock },
+      tabs: { query: tabsQueryMock, ungroup: ungroupMock }
+    });
+
+    await closeAllWindows();
+
+    // ungroup must have been called with only the grouped tab IDs (not -1)
+    expect(ungroupMock).toHaveBeenCalledOnce();
+    expect(ungroupMock).toHaveBeenCalledWith([10, 11]);
+
+    // ungroup must come before remove
+    expect(callOrder.indexOf("ungroup")).toBeLessThan(callOrder.indexOf("remove"));
+
+    // remove must still be called
+    expect(removeMock).toHaveBeenCalledOnce();
+    expect(removeMock).toHaveBeenCalledWith(1);
+  });
+
+  it("does NOT call chrome.tabs.ungroup() for tabs with groupId -1 (TAB_GROUP_ID_NONE)", async () => {
+    const getAllMock = vi.fn().mockResolvedValue([makeWindow(1)]);
+    // All tabs are ungrouped
+    const tabsQueryMock = vi.fn().mockResolvedValue([
+      makeTab(10, -1),
+      makeTab(11, -1)
+    ]);
+    const ungroupMock = vi.fn().mockResolvedValue(undefined);
+    const removeMock = vi.fn().mockResolvedValue(undefined);
+
+    vi.stubGlobal("chrome", {
+      windows: { getAll: getAllMock, remove: removeMock },
+      tabs: { query: tabsQueryMock, ungroup: ungroupMock }
+    });
+
+    await closeAllWindows();
+
+    // No grouped tabs — ungroup should not be called
+    expect(ungroupMock).not.toHaveBeenCalled();
+    // remove should still proceed
+    expect(removeMock).toHaveBeenCalledOnce();
+    expect(removeMock).toHaveBeenCalledWith(1);
+  });
+
+  it("swallows an ungroup failure and still calls windows.remove()", async () => {
+    const getAllMock = vi.fn().mockResolvedValue([makeWindow(1)]);
+    const tabsQueryMock = vi.fn().mockResolvedValue([makeTab(10, 5)]);
+    const ungroupMock = vi.fn().mockRejectedValue(new Error("ungroup failed"));
+    const removeMock = vi.fn().mockResolvedValue(undefined);
+
+    vi.stubGlobal("chrome", {
+      windows: { getAll: getAllMock, remove: removeMock },
+      tabs: { query: tabsQueryMock, ungroup: ungroupMock }
+    });
+
+    // Should not throw despite ungroup failing
+    await expect(closeAllWindows()).resolves.toBeUndefined();
+
+    // remove must still have been called
+    expect(removeMock).toHaveBeenCalledOnce();
+    expect(removeMock).toHaveBeenCalledWith(1);
+  });
+
+  it("skips the ungroup call for a window with no grouped tabs", async () => {
+    const getAllMock = vi.fn().mockResolvedValue([makeWindow(1)]);
+    // Window has no tabs at all
+    const tabsQueryMock = vi.fn().mockResolvedValue([]);
+    const ungroupMock = vi.fn().mockResolvedValue(undefined);
+    const removeMock = vi.fn().mockResolvedValue(undefined);
+
+    vi.stubGlobal("chrome", {
+      windows: { getAll: getAllMock, remove: removeMock },
+      tabs: { query: tabsQueryMock, ungroup: ungroupMock }
+    });
+
+    await closeAllWindows();
+
+    expect(ungroupMock).not.toHaveBeenCalled();
+    expect(removeMock).toHaveBeenCalledOnce();
+    expect(removeMock).toHaveBeenCalledWith(1);
   });
 });
