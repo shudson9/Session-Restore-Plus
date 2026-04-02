@@ -1,6 +1,6 @@
 import { isSnapshot, SNAPSHOT_SCHEMA_VERSION, type Snapshot, type SnapshotTab } from "./lib/snapshot";
 import { captureWindowGroups } from "./lib/capture";
-import { applyGroupsToWindow, closeAllWindows } from "./lib/restore";
+import { applyGroupsToWindow, cleanupDuplicateGroups, closeAllWindows } from "./lib/restore";
 
 const MENU_SAVE = "save_snapshot";
 const MENU_RESTORE_LAST = "restore_last_snapshot";
@@ -619,6 +619,9 @@ async function restoreSnapshotInternal(
     tabsSkipped: []
   };
 
+  const restoredWindowIds: number[] = [];
+  const restoredGroupSignatures: Array<{ title?: string; color: string }> = [];
+
   for (let windowIndex = 0; windowIndex < snapshot.windows.length; windowIndex += 1) {
     const snapshotWindow = snapshot.windows[windowIndex];
     const createdWindow = await createTargetWindow(snapshotWindow);
@@ -633,9 +636,16 @@ async function restoreSnapshotInternal(
 
     await applyPinnedAndActive(snapshotWindow.tabs, createdTabIdsByIndex);
     if (typeof createdWindow.id === "number") {
+      restoredWindowIds.push(createdWindow.id);
       await applyGroupsToWindow(createdWindow.id, snapshotWindow.groups, createdTabIdsByIndex);
     }
+
+    for (const group of snapshotWindow.groups) {
+      restoredGroupSignatures.push({ title: group.title, color: group.color });
+    }
   }
+
+  await cleanupDuplicateGroups(restoredWindowIds, restoredGroupSignatures);
 
   return { ok: true, summary };
 }

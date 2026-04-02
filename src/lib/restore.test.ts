@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { applyGroupsToWindow, closeAllWindows } from "./restore";
+import { applyGroupsToWindow, cleanupDuplicateGroups, closeAllWindows } from "./restore";
 import type { SnapshotGroup } from "./snapshot";
 
 function makeSnapshotGroup(overrides: Partial<SnapshotGroup> & Pick<SnapshotGroup, "tabIndexes">): SnapshotGroup {
@@ -31,6 +31,22 @@ function makeTabGroup(id: number): chrome.tabGroups.TabGroup {
     windowId: 1,
     title: "",
     color: "blue",
+    collapsed: false
+  } as chrome.tabGroups.TabGroup;
+}
+
+/** Build a chrome.tabGroups.TabGroup stub with explicit windowId, title, and color */
+function makeTabGroupFull(
+  id: number,
+  windowId: number,
+  title: string,
+  color: chrome.tabGroups.ColorEnum
+): chrome.tabGroups.TabGroup {
+  return {
+    id,
+    windowId,
+    title,
+    color,
     collapsed: false
   } as chrome.tabGroups.TabGroup;
 }
@@ -540,5 +556,126 @@ describe("closeAllWindows", () => {
     expect(ungroupMock).not.toHaveBeenCalled();
     expect(removeMock).toHaveBeenCalledOnce();
     expect(removeMock).toHaveBeenCalledWith(1);
+  });
+});
+
+describe("cleanupDuplicateGroups", () => {
+  it("ungroups tabs in an external group whose title+color matches a restored group", async () => {
+    // Restored window is 10; external group is in window 99
+    const externalGroup = makeTabGroupFull(55, 99, "Work", "blue");
+    const tabGroupsQueryMock = vi.fn().mockResolvedValue([externalGroup]);
+    const tabsQueryMock = vi.fn().mockResolvedValue([makeTab(201, 55), makeTab(202, 55)]);
+    const ungroupMock = vi.fn().mockResolvedValue(undefined);
+
+    vi.stubGlobal("chrome", {
+      tabGroups: { query: tabGroupsQueryMock },
+      tabs: { query: tabsQueryMock, ungroup: ungroupMock }
+    });
+
+    await cleanupDuplicateGroups([10], [{ title: "Work", color: "blue" }]);
+
+    expect(ungroupMock).toHaveBeenCalledOnce();
+    expect(ungroupMock).toHaveBeenCalledWith([201, 202]);
+  });
+
+  it("does NOT ungroup tabs in an external group whose title does not match", async () => {
+    const externalGroup = makeTabGroupFull(55, 99, "Personal", "blue");
+    const tabGroupsQueryMock = vi.fn().mockResolvedValue([externalGroup]);
+    const tabsQueryMock = vi.fn().mockResolvedValue([makeTab(201, 55)]);
+    const ungroupMock = vi.fn().mockResolvedValue(undefined);
+
+    vi.stubGlobal("chrome", {
+      tabGroups: { query: tabGroupsQueryMock },
+      tabs: { query: tabsQueryMock, ungroup: ungroupMock }
+    });
+
+    await cleanupDuplicateGroups([10], [{ title: "Work", color: "blue" }]);
+
+    expect(ungroupMock).not.toHaveBeenCalled();
+  });
+
+  it("does NOT ungroup tabs in an external group whose color does not match", async () => {
+    const externalGroup = makeTabGroupFull(55, 99, "Work", "red");
+    const tabGroupsQueryMock = vi.fn().mockResolvedValue([externalGroup]);
+    const tabsQueryMock = vi.fn().mockResolvedValue([makeTab(201, 55)]);
+    const ungroupMock = vi.fn().mockResolvedValue(undefined);
+
+    vi.stubGlobal("chrome", {
+      tabGroups: { query: tabGroupsQueryMock },
+      tabs: { query: tabsQueryMock, ungroup: ungroupMock }
+    });
+
+    await cleanupDuplicateGroups([10], [{ title: "Work", color: "blue" }]);
+
+    expect(ungroupMock).not.toHaveBeenCalled();
+  });
+
+  it("does NOT touch groups that are inside a restored window even if title+color matches", async () => {
+    // Group 55 is in the restored window (windowId 10)
+    const restoredWindowGroup = makeTabGroupFull(55, 10, "Work", "blue");
+    const tabGroupsQueryMock = vi.fn().mockResolvedValue([restoredWindowGroup]);
+    const tabsQueryMock = vi.fn().mockResolvedValue([makeTab(201, 55)]);
+    const ungroupMock = vi.fn().mockResolvedValue(undefined);
+
+    vi.stubGlobal("chrome", {
+      tabGroups: { query: tabGroupsQueryMock },
+      tabs: { query: tabsQueryMock, ungroup: ungroupMock }
+    });
+
+    await cleanupDuplicateGroups([10], [{ title: "Work", color: "blue" }]);
+
+    expect(ungroupMock).not.toHaveBeenCalled();
+  });
+
+  it("makes no ungroup calls when there are no external groups at all", async () => {
+    const tabGroupsQueryMock = vi.fn().mockResolvedValue([]);
+    const ungroupMock = vi.fn().mockResolvedValue(undefined);
+
+    vi.stubGlobal("chrome", {
+      tabGroups: { query: tabGroupsQueryMock },
+      tabs: { query: vi.fn().mockResolvedValue([]), ungroup: ungroupMock }
+    });
+
+    await cleanupDuplicateGroups([10], [{ title: "Work", color: "blue" }]);
+
+    expect(ungroupMock).not.toHaveBeenCalled();
+  });
+
+  it("swallows a failure from chrome.tabs.ungroup and does not throw", async () => {
+    const externalGroup = makeTabGroupFull(55, 99, "Work", "blue");
+    const tabGroupsQueryMock = vi.fn().mockResolvedValue([externalGroup]);
+    const tabsQueryMock = vi.fn().mockResolvedValue([makeTab(201, 55)]);
+    const ungroupMock = vi.fn().mockRejectedValue(new Error("ungroup failed"));
+
+    vi.stubGlobal("chrome", {
+      tabGroups: { query: tabGroupsQueryMock },
+      tabs: { query: tabsQueryMock, ungroup: ungroupMock }
+    });
+
+    await expect(
+      cleanupDuplicateGroups([10], [{ title: "Work", color: "blue" }])
+    ).resolves.toBeUndefined();
+  });
+
+  it("ungroups all external duplicate groups when multiple are present", async () => {
+    const group1 = makeTabGroupFull(55, 99, "Work", "blue");
+    const group2 = makeTabGroupFull(66, 98, "Work", "blue");
+    const tabGroupsQueryMock = vi.fn().mockResolvedValue([group1, group2]);
+
+    const tabsQueryMock = vi.fn()
+      .mockResolvedValueOnce([makeTab(201, 55), makeTab(202, 55)])
+      .mockResolvedValueOnce([makeTab(301, 66)]);
+    const ungroupMock = vi.fn().mockResolvedValue(undefined);
+
+    vi.stubGlobal("chrome", {
+      tabGroups: { query: tabGroupsQueryMock },
+      tabs: { query: tabsQueryMock, ungroup: ungroupMock }
+    });
+
+    await cleanupDuplicateGroups([10], [{ title: "Work", color: "blue" }]);
+
+    expect(ungroupMock).toHaveBeenCalledTimes(2);
+    expect(ungroupMock).toHaveBeenCalledWith([201, 202]);
+    expect(ungroupMock).toHaveBeenCalledWith([301]);
   });
 });
